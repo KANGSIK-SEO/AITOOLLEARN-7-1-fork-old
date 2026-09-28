@@ -78,6 +78,17 @@ cp .env.example .env         # 값 채우기
 .venv/bin/uvicorn app.main:app --reload    # http://localhost:8000
 .venv/bin/python -m pytest -q tests
 ```
+**Linux(Ubuntu 24.04) 환경에서 실행·검증**
+
+개발은 macOS에서 했고, 배포 전에 Ubuntu 24.04 컨테이너에서 동일 코드를 설치·테스트·실행해 검증했다.
+```bash
+docker build -t art-chatbot-ubuntu .
+docker run --rm art-chatbot-ubuntu python -m pytest -q tests          # 14 passed (Ubuntu 24.04, Python 3.12)
+docker run -d --rm -p 8000:8000 --env-file .env art-chatbot-ubuntu    # http://localhost:8000
+```
+Vercel Functions도 Linux 런타임에서 실행되며, 배포 명령(`vercel deploy --prod`)은 위 Ubuntu 환경의 셸에서 실행한다.
+서버 없이 Ubuntu 서버에 직접 올리는 경우에는 `apt install python3-venv` 후 위 "실행" 절차와 `uvicorn`을 systemd로 상시 실행하면 된다.
+
 **환경 변수** (`.env.example` 참고, 값은 절대 커밋하지 않는다)
 
 | 이름 | 설명 |
