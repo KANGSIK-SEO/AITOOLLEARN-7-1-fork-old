@@ -1,0 +1,80 @@
+"""질문 → (검색 의도 추출) → 미술 DB 검색 → (근거 기반 답변 생성) 파이프라인."""
+import json
+import logging
+import re
+
+from . import art, llm
+
+log = logging.getLogger("app.chat")
+
+INTENT_SYSTEM = (
+    "너는 퍼블릭 도메인 명화 검색 도우미의 '검색 의도 추출기'다. 사용자의 한국어/영어 요청을 "
+    "영어 검색 조건 JSON 하나로만 출력하라. 설명·코드블록 금지.\n"
+    '형식: {"chitchat": bool, "keywords": [영어 단어 최대 6개], "artist": 영어 작가명 또는 null, '
+    '"year_from": 정수 또는 null, "year_to": 정수 또는 null}\n'
+    "- 작품 검색이 아니라 직전 대화를 묻는 질문(예: 내가 방금 뭘 물어봤지?)이나 인사면 chitchat=true.\n"
+    "- keywords는 주제·분위기·색·소재 등 (예: spring, landscape, flowers, portrait, winter, sea)."
+)
+
+ANSWER_SYSTEM = (
+    "너는 '퍼블릭 도메인 명화 찾기' 챗봇이다. 한국어로 간결하게 답한다.\n"
+    "규칙:\n"
+    "1. 아래 [검색 결과]에 있는 작품만 언급한다. 없는 작품·작가·연도를 지어내지 않는다.\n"
+    "2. 작품은 [1], [2] 번호로 인용하고, 각 작품이 왜 요청에 맞는지 한 줄씩 설명한다.\n"
+    "3. 검색 결과는 MET·Art Institute of Chicago가 CC0(퍼블릭 도메인)로 공개한 것이다. "
+    "상업적 이용이 가능하지만 사용 전 '출처 페이지'에서 조건을 확인하도록 한 줄 안내한다.\n"
+    "4. 검색 결과가 비어 있으면 없다고 말하고 더 구체적인 조건(작가, 시대, 주제)을 제안한다.\n"
+    "5. 직전 대화를 묻는 질문이면 [이전 대화]를 근거로 답한다."
+)
+
+
+def _parse_intent(text: str) -> dict:
+    match = re.search(r"\{.*\}", text, re.S)
+    try:
+        data = json.loads(match.group(0)) if match else {}
+    except json.JSONDecodeError:
+        data = {}
+    kw = data.get("keywords")
+    return {
+        "chitchat": bool(data.get("chitchat")),
+        "keywords": [str(k) for k in kw][:6] if isinstance(kw, list) else [],
+        "artist": data.get("artist") if isinstance(data.get("artist"), str) else None,
+        "year_from": data.get("year_from") if isinstance(data.get("year_from"), int) else None,
+        "year_to": data.get("year_to") if isinstance(data.get("year_to"), int) else None,
+    }
+
+
+def extract_intent(question: str) -> dict:
+    raw = llm.chat_completion(
+        [{"role": "system", "content": INTENT_SYSTEM}, {"role": "user", "content": question}],
+        max_tokens=200, temperature=0.0,
+    )
+    return _parse_intent(raw)
+
+
+def find_artworks(intent: dict) -> list[dict]:
+    if intent["chitchat"]:
+        return []
+    found = art.search(intent["keywords"], intent["artist"], intent["year_from"], intent["year_to"])
+    if not found and (intent["artist"] or intent["year_from"] or intent["year_to"]):
+        found = art.search(intent["keywords"])  # 조건이 너무 좁으면 키워드만으로 완화
+    return found
+
+
+def _format_results(works: list[dict]) -> str:
+    if not works:
+        return "(없음)"
+    return "\n".join(
+        f"[{i}] {w['title']} — {w['artist'] or '작가 미상'}, {w['date_display'] or '연도 미상'}, "
+        f"{w['medium'] or ''} | {w['license']} | 출처: {w['source'].upper()}"
+        for i, w in enumerate(works, 1)
+    )
+
+
+def compose_answer(question: str, works: list[dict], history: list[dict]) -> str:
+    past = "\n".join(f"Q: {h['question']}\nA: {(h['answer'] or '')[:300]}" for h in history) or "(없음)"
+    user = f"[이전 대화]\n{past}\n\n[검색 결과]\n{_format_results(works)}\n\n[질문]\n{question}"
+    return llm.chat_completion(
+        [{"role": "system", "content": ANSWER_SYSTEM}, {"role": "user", "content": user}],
+        max_tokens=700, temperature=0.3,
+    )

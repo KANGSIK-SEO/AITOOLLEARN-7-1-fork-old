@@ -1,0 +1,136 @@
+"""사용자·대화 로그 DB.
+
+TURSO_DATABASE_URL이 있으면 Turso(HTTP API), 없으면 로컬 SQLite 파일(data/app.db)을 쓴다.
+두 백엔드 모두 execute(sql, params) -> list[dict] 로 동일하게 사용한다. (INSERT는 RETURNING 사용)
+"""
+import json
+import logging
+import os
+import sqlite3
+import urllib.error
+import urllib.request
+
+from .config import ROOT
+
+log = logging.getLogger("app.db")
+
+SCHEMA = [
+    """CREATE TABLE IF NOT EXISTS users (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        email         TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        created_at    TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS chats (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id     INTEGER NOT NULL REFERENCES users(id),
+        question    TEXT NOT NULL,
+        answer      TEXT,
+        status      TEXT NOT NULL CHECK (status IN ('ok', 'error')),
+        error_code  TEXT,
+        latency_ms  INTEGER,
+        artwork_ids TEXT,          -- JSON 배열 (artworks.id)
+        created_at  TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_chats_user_time ON chats (user_id, created_at)",
+]
+
+_initialized = False
+
+
+class DbError(RuntimeError):
+    pass
+
+
+def _turso_url() -> str | None:
+    url = os.environ.get("TURSO_DATABASE_URL", "").strip()
+    return url.replace("libsql://", "https://", 1) if url else None
+
+
+def _to_arg(v) -> dict:
+    if v is None:
+        return {"type": "null"}
+    if isinstance(v, bool):
+        return {"type": "integer", "value": str(int(v))}
+    if isinstance(v, int):
+        return {"type": "integer", "value": str(v)}
+    if isinstance(v, float):
+        return {"type": "float", "value": v}
+    return {"type": "text", "value": str(v)}
+
+
+def _from_value(v: dict):
+    t = v.get("type")
+    if t == "null":
+        return None
+    if t == "integer":
+        return int(v["value"])
+    if t == "float":
+        return float(v["value"])
+    return v.get("value")
+
+
+def _turso_execute(base: str, sql: str, params) -> list[dict]:
+    body = {"requests": [
+        {"type": "execute", "stmt": {"sql": sql, "args": [_to_arg(p) for p in params]}},
+        {"type": "close"},
+    ]}
+    req = urllib.request.Request(
+        f"{base}/v2/pipeline",
+        data=json.dumps(body).encode(),
+        headers={
+            "Authorization": f"Bearer {os.environ.get('TURSO_AUTH_TOKEN', '')}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise DbError(f"Turso 연결 실패: {e}") from e
+    first = data["results"][0]
+    if first["type"] == "error":
+        raise DbError(first["error"].get("message", "Turso 오류"))
+    result = first["response"]["result"]
+    cols = [c["name"] for c in result["cols"]]
+    return [dict(zip(cols, (_from_value(v) for v in row))) for row in result["rows"]]
+
+
+def _local_execute(sql: str, params) -> list[dict]:
+    path = os.environ.get("LOCAL_DB_PATH") or str(ROOT / "data" / "app.db")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+        conn.commit()
+        return rows
+    except sqlite3.Error as e:
+        raise DbError(str(e)) from e
+    finally:
+        conn.close()
+
+
+def execute(sql: str, params=()) -> list[dict]:
+    ensure_schema()
+    return _raw_execute(sql, params)
+
+
+def _raw_execute(sql: str, params=()) -> list[dict]:
+    base = _turso_url()
+    return _turso_execute(base, sql, params) if base else _local_execute(sql, params)
+
+
+def ensure_schema() -> None:
+    global _initialized
+    if _initialized:
+        return
+    for stmt in SCHEMA:
+        _raw_execute(stmt)
+    _initialized = True
+    log.info("db_schema_ready backend=%s", "turso" if _turso_url() else "local_sqlite")
+
+
+def reset_for_tests() -> None:
+    global _initialized
+    _initialized = False

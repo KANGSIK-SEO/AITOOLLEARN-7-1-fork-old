@@ -5,6 +5,25 @@
 """
 import os
 from datetime import date
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def _load_dotenv() -> None:
+    """의존성 없이 .env를 읽는다. 이미 설정된 환경 변수(Vercel 등)는 덮어쓰지 않는다."""
+    env_file = ROOT / ".env"
+    if not env_file.is_file():
+        return
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+_load_dotenv()
 
 ALLOWED_MODEL = "solar-pro3"
 AI_CUTOFF_DATE = date(2027, 4, 1)  # 이 날짜 이후(포함) 모든 AI 호출 차단
@@ -35,3 +54,16 @@ def get_api_key() -> str:
     if not key:
         raise AIUnavailableError("AI_KEY_MISSING", "UPSTAGE_API_KEY가 설정되지 않았습니다.")
     return key
+
+
+def get_secret_key() -> str:
+    key = os.environ.get("SECRET_KEY", "")
+    if len(key) < 32:
+        raise RuntimeError("SECRET_KEY가 없거나 너무 짧습니다 (32자 이상).")
+    return key
+
+
+LLM_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT_SECONDS", "20"))
+CHAT_MAX_LENGTH = 500          # 질문 최대 글자 수
+CONTEXT_TURNS = 5              # 문맥으로 넘기는 최근 대화 수
+CHAT_LIMIT_PER_HOUR = 30       # 사용자별 시간당 질문 상한 (무료 API 보호)
