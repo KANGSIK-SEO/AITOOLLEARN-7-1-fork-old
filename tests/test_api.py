@@ -97,3 +97,34 @@ def test_users_cannot_see_others_logs(client, monkeypatch):
     other = TestClient(app)
     other.post("/api/auth/signup", json={"email": "two@x.com", "password": "password123"})
     assert other.get("/api/me/chats").json()["chats"] == []
+
+
+def test_aic_image_urls_are_proxied(client):
+    from app import art
+    work = {"source": "aic", "image_url": "https://www.artic.edu/iiif/2/bda9058b-5be6-37d0-e5a6-926584540757/full/1686,/0/default.jpg"}
+    out = art.with_proxy_urls(work)
+    assert out["thumbnail_url"] == "/api/img/aic/bda9058b-5be6-37d0-e5a6-926584540757?w=400"
+    assert out["image_url"].endswith("?w=1686")
+    assert art.with_proxy_urls({"source": "met", "image_url": "https://images.metmuseum.org/x.jpg"})["image_url"].startswith("https://images")
+
+
+def test_image_proxy_validates_and_sends_aic_header(client, monkeypatch):
+    seen = {}
+
+    class FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b"\xff\xd8jpeg"
+
+    def fake_urlopen(req, timeout=0):
+        seen["url"], seen["hdr"] = req.full_url, dict(req.header_items())
+        return FakeResp()
+
+    monkeypatch.setattr("app.main.urllib.request.urlopen", fake_urlopen)
+    ok = client.get("/api/img/aic/bda9058b-5be6-37d0-e5a6-926584540757?w=400")
+    assert ok.status_code == 200 and ok.headers["content-type"] == "image/jpeg"
+    assert "immutable" in ok.headers["cache-control"]
+    assert "Aic-user-agent" in seen["hdr"] and "@" not in seen["hdr"]["Aic-user-agent"]
+    assert not seen["hdr"]["User-agent"].startswith("Python-urllib")
+    assert client.get("/api/img/aic/not-a-uuid?w=400").status_code == 400
+    assert client.get("/api/img/aic/bda9058b-5be6-37d0-e5a6-926584540757?w=999").status_code == 400

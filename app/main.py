@@ -1,15 +1,19 @@
 """FastAPI 앱: 회원가입/로그인, 챗봇 질문/응답, 내 대화 로그 조회."""
 import json
 import logging
+import re
+import socket
 import sqlite3
 import time
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -198,3 +202,30 @@ def my_chats(limit: int = 20, offset: int = 0, user_id: int = Depends(current_us
         "SELECT id, question, answer, status, error_code, latency_ms, created_at FROM chats "
         "WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?", (user_id, limit, max(0, offset)))
     return {"chats": rows}
+
+
+# ---- AIC 이미지 프록시 ----
+# AIC 이미지 서버는 `AIC-User-Agent` 헤더와 (파이썬 기본이 아닌) User-Agent가 없으면 403을 준다. 브라우저 <img>는 헤더를 붙일 수 없어 서버가 대신 받는다.
+AIC_IIIF = "https://www.artic.edu/iiif/2"
+AIC_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+AIC_WIDTHS = {200, 400, 843, 1686}
+AIC_UA = "AITOOLLEARN-7-1 (student project; https://github.com/KANGSIK-SEO/AITOOLLEARN-7-1)"
+
+
+@app.get("/api/img/aic/{image_id}")
+def aic_image(image_id: str, w: int = 400):
+    if not AIC_ID_RE.match(image_id) or w not in AIC_WIDTHS:
+        return error(400, "INVALID_IMAGE", "지원하지 않는 이미지 요청입니다.")
+    req = urllib.request.Request(f"{AIC_IIIF}/{image_id}/full/{w},/0/default.jpg", headers={"AIC-User-Agent": AIC_UA, "User-Agent": "AITOOLLEARN-7-1/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as e:
+        log.warning("image_proxy_failure image_id=%s status=%s", image_id, e.code)
+        return error(404 if e.code == 404 else 502, "IMAGE_UNAVAILABLE", "이미지를 불러오지 못했습니다.")
+    except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+        log.warning("image_proxy_failure image_id=%s detail=%s", image_id, e)
+        return error(502, "IMAGE_UNAVAILABLE", "이미지를 불러오지 못했습니다.")
+    # 이미지는 바뀌지 않으므로 CDN·브라우저에 오래 캐시해 프록시 호출을 최소화한다
+    return Response(body, media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=86400, s-maxage=31536000, immutable"})

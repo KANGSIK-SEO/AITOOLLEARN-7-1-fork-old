@@ -11,6 +11,20 @@ CARD_FIELDS = (
 )
 
 
+AIC_IMAGE_RE = re.compile(r"/iiif/2/([0-9a-f-]{36})/")
+
+
+def with_proxy_urls(work: dict) -> dict:
+    """AIC 이미지는 전용 헤더가 없으면 403이라 브라우저가 직접 못 받는다 → 우리 서버 프록시 주소로 바꾼다."""
+    if work.get("source") == "aic":
+        m = AIC_IMAGE_RE.search(work.get("image_url") or "")
+        if m:
+            work = {**work,
+                    "thumbnail_url": f"/api/img/aic/{m.group(1)}?w=400",
+                    "image_url": f"/api/img/aic/{m.group(1)}?w=1686"}
+    return work
+
+
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(f"file:{ART_DB}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
@@ -50,6 +64,6 @@ def search(keywords: list[str], artist: str | None = None,
             sql = (f"SELECT {CARD_FIELDS} FROM artworks a WHERE {' AND '.join(where)} "
                    "ORDER BY a.is_highlight DESC, a.id LIMIT ?")
             rows = conn.execute(sql, [*params, limit]).fetchall()
-        return [dict(r) for r in rows]
+        return [with_proxy_urls(dict(r)) for r in rows]
     finally:
         conn.close()
